@@ -4,7 +4,8 @@ import logging
 import time
 import threading
 import random
-from multiprocessing import Process
+import asyncio
+from multiprocessing import Process, Manager
 from flask import Flask
 from openai import OpenAI
 from telegram import Update
@@ -27,9 +28,9 @@ if not all([TOKEN_TAWA, TOKEN_ISIP, TOKEN_BOBO]):
     raise ValueError("Missing bot tokens. Set BOT_TOKEN_TAWA, BOT_TOKEN_ISIP, BOT_TOKEN_BOBO")
 
 bots_config = [
-    {"name": "Tawa", "token": TOKEN_TAWA, "system_prompt": config["bots"][0]["system_prompt"], "is_controller": True},
-    {"name": "Isip", "token": TOKEN_ISIP, "system_prompt": config["bots"][1]["system_prompt"], "is_controller": False},
-    {"name": "Bobo", "token": TOKEN_BOBO, "system_prompt": config["bots"][2]["system_prompt"], "is_controller": False},
+    {"name": "Tawa", "token": TOKEN_TAWA, "system_prompt": config["bots"][0]["system_prompt"]},
+    {"name": "Isip", "token": TOKEN_ISIP, "system_prompt": config["bots"][1]["system_prompt"]},
+    {"name": "Bobo", "token": TOKEN_BOBO, "system_prompt": config["bots"][2]["system_prompt"]},
 ]
 
 # --- Shared OpenAI Client ---
@@ -44,22 +45,16 @@ SPONTANEOUS_KEYWORDS = [
 SPONTANEOUS_CHANCE = 0.3
 SPONTANEOUS_COOLDOWN = 300  # 5 minutes
 
-# --- State file ---
-STATE_FILE = "/tmp/bot_state.txt"  # /tmp is writable in Render
-
-def read_state():
-    try:
-        with open(STATE_FILE, 'r') as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return "tahimik"  # default
-
-def write_state(state):
-    with open(STATE_FILE, 'w') as f:
-        f.write(state)
+# --- Shared state for conversation mode (using Manager for multiprocessing) ---
+manager = Manager()
+conversation_mode = manager.dict()
+conversation_mode['active'] = False
+conversation_mode['chat_id'] = None
+conversation_mode['last_bot'] = None
+conversation_mode['message_count'] = 0
 
 # ==================== BOT WORKER ====================
-def run_bot(bot_name, bot_token, system_prompt, is_controller):
+def run_bot(bot_name, bot_token, system_prompt, conv_mode):
     logging.basicConfig(format=f"%(asctime)s - {bot_name} - %(levelname)s - %(message)s", level=logging.INFO)
     logger = logging.getLogger(__name__)
 
@@ -103,28 +98,42 @@ def run_bot(bot_name, bot_token, system_prompt, is_controller):
         message = update.message
         text = message.text
 
-        # Handle commands (only controller bot responds to /galaw and /tahimik)
-        if is_controller and text.startswith('/'):
-            if text == '/galaw':
-                write_state('galaw')
-                await message.reply_text("🕺 G na! Mag-usap tayo mga pre!")
-                # Trigger a conversation starter
-                time.sleep(2)
-                await message.reply_text("Uy, @isip_slots_bot @bobo_slots_bot, gising! Kwentuhan tayo about slots!")
-                return
-            elif text == '/tahimik':
-                write_state('tahimik')
-                await message.reply_text("🤫 Sige, tahimik muna. Balik na lang kayo pag may kailangan.")
-                return
-            else:
-                return  # ignore other commands
+        # --- Check for commands ---
+        if text.startswith('/galaw'):
+            conv_mode['active'] = True
+            conv_mode['chat_id'] = chat_id
+            conv_mode['message_count'] = 0
+            conv_mode['last_bot'] = None
+            await message.reply_text(f"🎮 {bot_name}: G na! Mag-uusap kami ni Isip at Bobo!")
+            return
 
-        # Check current state
-        current_state = read_state()
-        if current_state == 'tahimik':
-            return  # Don't respond if in silent mode
+        if text.startswith('/tahimik'):
+            conv_mode['active'] = False
+            await message.reply_text(f"🤫 {bot_name}: Sige, tahimik na muna.")
+            return
 
-        # For non-command messages, proceed with normal logic
+        # --- Conversation mode logic ---
+        if conv_mode['active'] and conv_mode['chat_id'] == chat_id:
+            # I-trigger ang susunod na bot kung hindi ito ang huling sumagot
+            if conv_mode['message_count'] < 5:  # Max 5 exchanges
+                # Piliin ang susunod na bot (hindi ang kasalukuyan at hindi ang huli)
+                available_bots = [b for b in ['Tawa', 'Isip', 'Bobo'] if b != bot_name and b != conv_mode['last_bot']]
+                if available_bots:
+                    next_bot = random.choice(available_bots)
+                    conv_mode['last_bot'] = bot_name
+                    conv_mode['message_count'] += 1
+                    
+                    # Maghintay at mag-type bago sumagot
+                    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+                    await asyncio.sleep(5)
+                    
+                    # Bumuo ng response na directed sa susunod na bot
+                    prompt = f"Kausapin mo si {next_bot} tungkol sa slots o kung ano man. Maikli lang."
+                    response = generate_response(prompt, chat_id)
+                    await message.reply_text(response)
+            return
+
+        # --- Normal reply logic (targeted or spontaneous) ---
         is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id
         is_mention = context.bot.username and f"@{context.bot.username}" in text
 
@@ -147,7 +156,7 @@ def run_bot(bot_name, bot_token, system_prompt, is_controller):
             return
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        time.sleep(8)
+        await asyncio.sleep(8)
 
         try:
             response = generate_response(text, chat_id)
@@ -164,6 +173,10 @@ def run_bot(bot_name, bot_token, system_prompt, is_controller):
     for attempt in range(max_retries):
         try:
             tg_app = Application.builder().token(bot_token).connect_timeout(30).read_timeout(30).build()
+            
+            # Add handlers
+            tg_app.add_handler(CommandHandler("galaw", handle_message))
+            tg_app.add_handler(CommandHandler("tahimik", handle_message))
             tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
             tg_app.add_error_handler(error_handler)
             
@@ -194,9 +207,6 @@ def run_flask():
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
-    # Initialize state file to 'tahimik' by default
-    write_state('tahimik')
-    
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
@@ -207,7 +217,7 @@ if __name__ == "__main__":
             print(f"⏱️ Waiting {delay:.1f} seconds before starting {bot['name']}...")
             time.sleep(delay)
         
-        p = Process(target=run_bot, args=(bot["name"], bot["token"], bot["system_prompt"], bot["is_controller"]))
+        p = Process(target=run_bot, args=(bot["name"], bot["token"], bot["system_prompt"], conversation_mode))
         p.start()
         processes.append(p)
         print(f"✅ Started {bot['name']} in process {p.pid}")
