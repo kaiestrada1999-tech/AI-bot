@@ -1,4 +1,4 @@
 python-telegram-bot==20.7
 transformers==4.36.2
-torch==2.1.2
+torch>=2.5.0
 flask==3.0.0
