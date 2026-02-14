@@ -10,17 +10,23 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Kunin mula sa environment variables
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("No BOT_TOKEN environment variable set")
+
+# Para hindi mag-compile ng Rust packages (gagamit ng pre-built wheels)
+os.environ["CARGO_HOME"] = "/tmp/.cargo"
+os.environ["RUSTUP_HOME"] = "/tmp/.rustup"
+
+# Force CPU at memory optimization
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+os.environ["OMP_NUM_THREADS"] = "1"
 
 REPLY_TO_ALL = True           # True = sa lahat ng message sasagot; False = sa tanong lang
 QUESTION_ONLY = not REPLY_TO_ALL
 DELAY_SECONDS = 10             # Delay bago sumagot
 USE_PER_CHAT_HISTORY = True    # True = iisa lang history per group; False = per user
-
-# Para tipirin ang memory sa Render free tier
-torch.set_num_threads(1)
 
 # ==================== LOGGING ====================
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
