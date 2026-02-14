@@ -123,12 +123,27 @@ def run_bot(bot_name, bot_token, system_prompt):
     async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Update {update} caused error {context.error}")
 
-    tg_app = Application.builder().token(bot_token).build()
-    tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    tg_app.add_error_handler(error_handler)
-
-    logger.info(f"{bot_name} started.")
-    tg_app.run_polling()
+    # --- Retry mechanism para sa connection ---
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Taasan ang connection timeout
+            tg_app = Application.builder().token(bot_token).connect_timeout(30).read_timeout(30).build()
+            tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+            tg_app.add_error_handler(error_handler)
+            
+            logger.info(f"{bot_name} starting (attempt {attempt+1})...")
+            tg_app.run_polling()
+            break  # Pag successful, exit loop
+        except Exception as e:
+            logger.error(f"{bot_name} failed to start: {e}")
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+                logger.info(f"{bot_name} retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"{bot_name} failed after {max_retries} attempts. Giving up.")
+                raise
 
 # ==================== FLASK HEALTH CHECK ====================
 app = Flask(__name__)
@@ -148,7 +163,14 @@ if __name__ == "__main__":
     flask_thread.start()
 
     processes = []
-    for bot in bots_config:
+    for i, bot in enumerate(bots_config):
+        # Maghintay ng random na pagitan bago i-start ang bawat bot
+        # para hindi sabay-sabay mag-connect sa Telegram
+        if i > 0:
+            delay = random.uniform(3, 7)  # 3-7 seconds delay
+            print(f"⏱️ Waiting {delay:.1f} seconds before starting {bot['name']}...")
+            time.sleep(delay)
+        
         p = Process(target=run_bot, args=(bot["name"], bot["token"], bot["system_prompt"]))
         p.start()
         processes.append(p)
