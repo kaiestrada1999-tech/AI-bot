@@ -41,7 +41,7 @@ model_name = "facebook/blenderbot_small-90M"
 tokenizer = BlenderbotSmallTokenizer.from_pretrained(model_name)
 model = BlenderbotSmallForConditionalGeneration.from_pretrained(
     model_name,
-    low_cpu_mem_usage=True
+    low_cpu_mem_usage=True  # Ngayon ay gagana na dahil may accelerate
 )
 logger.info("Model loaded successfully!")
 
