@@ -1,121 +1,87 @@
 import os
 import logging
-import random
 import time
 import threading
-import torch
 from flask import Flask
-from transformers import BlenderbotSmallForConditionalGeneration, BlenderbotSmallTokenizer
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
 if not BOT_TOKEN:
     raise ValueError("No BOT_TOKEN environment variable set")
+if not OPENAI_API_KEY:
+    raise ValueError("No OPENAI_API_KEY environment variable set")
 
-# Para hindi mag-compile ng Rust packages (gagamit ng pre-built wheels)
-os.environ["CARGO_HOME"] = "/tmp/.cargo"
-os.environ["RUSTUP_HOME"] = "/tmp/.rustup"
-
-# Force CPU at memory optimization
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
-os.environ["OMP_NUM_THREADS"] = "1"
-
-# Para tipirin ang memory sa pag-load ng model
-os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
-
-REPLY_TO_ALL = True           # True = sa lahat ng message sasagot; False = sa tanong lang
-QUESTION_ONLY = not REPLY_TO_ALL
-DELAY_SECONDS = 10             # Delay bago sumagot
-USE_PER_CHAT_HISTORY = True    # True = iisa lang history per group; False = per user
+DELAY_SECONDS = 10  # Delay bago sumagot
 
 # ==================== LOGGING ====================
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== LOAD MODEL (once) ====================
-logger.info("Loading BlenderBot Small model...")
-model_name = "facebook/blenderbot_small-90M"
-tokenizer = BlenderbotSmallTokenizer.from_pretrained(model_name)
-model = BlenderbotSmallForConditionalGeneration.from_pretrained(
-    model_name,
-    low_cpu_mem_usage=True  # Ngayon ay gagana na dahil may accelerate
-)
-logger.info("Model loaded successfully!")
+# ==================== OPENAI CLIENT ====================
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ==================== CONVERSATION HISTORY ====================
+# Simple dictionary: chat_id -> list of messages
 chat_histories = {}
 
-# Filipino fillers at prefixes
-FILLERS = ["", " hmm", " ah", " e", " o", " ha", " no?", " diba?"]
-PREFIXES = ["", "Sa tingin ko ", "Para sa akin ", "Siguro ", "Ewan ko ha, pero "]
+# System prompt para maging casual at Filipino
+SYSTEM_PROMPT = """Ikaw ay isang kaibigang Pinoy na nakikipagkwentuhan sa group chat. 
+Maging natural, casual, at conversational. 
+Gumamit ng konting Taglish (Tagalog-English) at mga Filipino expressions like 'pre', 'bes', 'kasi', 'ano ba'.
+Huwag maging formal o parang bot. Parang tropa lang."""
 
-QUESTION_WORDS = ["ano", "sino", "bakit", "paano", "saan", "kailan", "magkano", "alin",
-                  "what", "who", "why", "how", "where", "when", "which"]
-
-# ==================== HELPER FUNCTIONS ====================
-def is_question(text: str) -> bool:
-    text_lower = text.lower().strip()
-    if "?" in text:
-        return True
-    words = text_lower.split()
-    if words and words[0] in QUESTION_WORDS:
-        return True
-    return False
-
-def generate_response(user_input: str, history_key: int) -> str:
-    # Simple history: store last 4 exchanges
-    if history_key not in chat_histories:
-        chat_histories[history_key] = []
-
-    # Add user input to history
-    chat_histories[history_key].append(user_input)
-
-    # Tokenize current input
-    inputs = tokenizer([user_input], return_tensors="pt", truncation=True, max_length=128)
-
-    # Generate response
-    with torch.no_grad():
-        reply_ids = model.generate(
-            **inputs,
-            max_length=100,
-            do_sample=True,
-            top_k=50,
-            top_p=0.95,
-            temperature=0.8,
-            pad_token_id=tokenizer.eos_token_id
+def generate_response(user_input: str, chat_id: int) -> str:
+    """Generate response using OpenAI API"""
+    
+    # Initialize history kung wala pa
+    if chat_id not in chat_histories:
+        chat_histories[chat_id] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+    
+    # Add user message
+    chat_histories[chat_id].append({"role": "user", "content": user_input})
+    
+    # Keep only last 10 messages (para tipid sa tokens)
+    if len(chat_histories[chat_id]) > 11:  # 1 system + 10 exchanges
+        chat_histories[chat_id] = [chat_histories[chat_id][0]] + chat_histories[chat_id][-10:]
+    
+    try:
+        # Call OpenAI API
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",  # Pwedeng "gpt-4" kung meron
+            messages=chat_histories[chat_id],
+            max_tokens=150,
+            temperature=0.8
         )
-
-    response = tokenizer.batch_decode(reply_ids, skip_special_tokens=True)[0]
-
-    # Add bot response to history
-    chat_histories[history_key].append(response)
-
-    # Keep only last 10 exchanges para di lumaki masyado
-    if len(chat_histories[history_key]) > 10:
-        chat_histories[history_key] = chat_histories[history_key][-10:]
-
-    # Filipino touches
-    if random.random() < 0.3:
-        response = random.choice(PREFIXES) + response.lower()
-    if random.random() < 0.4:
-        response += random.choice(FILLERS)
-
-    return response
+        
+        reply = response.choices[0].message.content
+        
+        # Add bot response to history
+        chat_histories[chat_id].append({"role": "assistant", "content": reply})
+        
+        return reply
+        
+    except Exception as e:
+        logger.error(f"OpenAI API error: {e}")
+        return "Sorry pre, na-ERROR ako saglit. Try mo ulit?"
 
 # ==================== TELEGRAM HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Ako si 'Kaibigan' – kasama ninyo sa group. Magtatanong lang kayo, sasagot ako… pero antagal ko mag-isip, mga 10 seconds! 😅"
+        "👋 Pre! Ako si 'Kaibigan' – kasama niyo sa group. Tanong lang kayo, sasagot ako after 10 seconds! 😅"
     )
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in chat_histories:
         del chat_histories[chat_id]
-    await update.message.reply_text("🔄 Nakalimutan ko na ang pinag-usapan natin. Sige, magsimula tayong muli.")
+    await update.message.reply_text("🔄 Nakalimutan ko na usapan natin. Sige, simula ulit!")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Huwag replyan ang sarili
@@ -125,24 +91,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    message_text = update.message.text
-
-    if QUESTION_ONLY and not is_question(message_text):
-        return
-
-    if USE_PER_CHAT_HISTORY:
-        history_key = update.effective_chat.id
-    else:
-        history_key = update.effective_user.id if update.effective_user else update.effective_chat.id
-
     # Ipakita ang typing at maghintay
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     time.sleep(DELAY_SECONDS)
 
     try:
-        response = generate_response(message_text, history_key)
+        response = generate_response(update.message.text, update.effective_chat.id)
     except Exception as e:
-        logger.error(f"Error generating response: {e}")
+        logger.error(f"Error: {e}")
         response = "Sorry, may error. Paki-ulit?"
 
     await update.message.reply_text(response)
@@ -150,7 +106,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.warning(f"Update {update} caused error {context.error}")
 
-# ==================== FLASK WEB SERVER (for health checks) ====================
+# ==================== FLASK HEALTH CHECK ====================
 app = Flask(__name__)
 
 @app.route('/')
@@ -164,7 +120,7 @@ def run_flask():
 
 # ==================== MAIN ====================
 def main():
-    # Start Flask in a background thread
+    # Start Flask
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
