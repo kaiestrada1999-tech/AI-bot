@@ -37,33 +37,36 @@ bots_config = [
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- Settings ---
-SPONTANEOUS_KEYWORDS = [
+SLOTS_KEYWORDS = [
     'slot', 'jackpot', 'casino', 'manalo', 'talo', 'sugal', 'pustahan',
     'bigballer', 'agilaclub', 'quantumbbc', 'fortuneplay', 'helpslotsbot',
-    'panalo', 'spin', 'bonus', 'free spin', 'gambling'
+    'panalo', 'spin', 'bonus', 'free spin', 'gambling', 'pano manalo',
+    'paano manalo', 'ano maganda', 'saan maganda', 'anong maganda'
 ]
-SPONTANEOUS_CHANCE = 0.3
-SPONTANEOUS_COOLDOWN = 300  # 5 minutes
 
-# --- Shared state for conversation mode (using Manager for multiprocessing) ---
+# --- Shared state for conversation control ---
 manager = Manager()
-conversation_mode = manager.dict()
-conversation_mode['active'] = False
-conversation_mode['chat_id'] = None
-conversation_mode['last_bot'] = None
-conversation_mode['message_count'] = 0
+conv_state = manager.dict()
+conv_state['enabled'] = True
+conv_state['active'] = False
+conv_state['chat_id'] = None
+conv_state['last_bot'] = None
+conv_state['message_count'] = 0
+conv_state['last_message_time'] = 0
 
 # ==================== BOT WORKER ====================
-def run_bot(bot_name, bot_token, system_prompt, conv_mode):
+def run_bot(bot_name, bot_token, system_prompt, state):
     logging.basicConfig(format=f"%(asctime)s - {bot_name} - %(levelname)s - %(message)s", level=logging.INFO)
     logger = logging.getLogger(__name__)
 
     chat_histories = {}
     last_spontaneous_time = {}
 
-    def contains_keyword(text):
+    def is_question(text):
         text_lower = text.lower()
-        return any(kw in text_lower for kw in SPONTANEOUS_KEYWORDS)
+        has_question_mark = '?' in text
+        has_keyword = any(kw in text_lower for kw in SLOTS_KEYWORDS)
+        return has_question_mark and has_keyword
 
     def generate_response(user_input: str, chat_id: int) -> str:
         if chat_id not in chat_histories:
@@ -78,7 +81,7 @@ def run_bot(bot_name, bot_token, system_prompt, conv_mode):
             response = openai_client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=chat_histories[chat_id],
-                max_tokens=60,
+                max_tokens=70,
                 temperature=0.9
             )
             reply = response.choices[0].message.content
@@ -97,40 +100,78 @@ def run_bot(bot_name, bot_token, system_prompt, conv_mode):
         chat_id = update.effective_chat.id
         message = update.message
         text = message.text
+        now = time.time()
 
-        # --- Check for commands ---
-        if text.startswith('/galaw'):
-            conv_mode['active'] = True
-            conv_mode['chat_id'] = chat_id
-            conv_mode['message_count'] = 0
-            conv_mode['last_bot'] = None
-            await message.reply_text(f"🎮 {bot_name}: G na! Mag-uusap kami ni Isip at Bobo!")
-            return
-
+        # --- Handle /tahimik and /galaw commands ---
         if text.startswith('/tahimik'):
-            conv_mode['active'] = False
-            await message.reply_text(f"🤫 {bot_name}: Sige, tahimik na muna.")
+            state['enabled'] = False
+            state['active'] = False
+            await message.reply_text(f"🤫 Sige, tahimik muna kami.")
             return
 
-        # --- Conversation mode logic ---
-        if conv_mode['active'] and conv_mode['chat_id'] == chat_id:
-            # I-trigger ang susunod na bot kung hindi ito ang huling sumagot
-            if conv_mode['message_count'] < 5:  # Max 5 exchanges
-                # Piliin ang susunod na bot (hindi ang kasalukuyan at hindi ang huli)
-                available_bots = [b for b in ['Tawa', 'Isip', 'Bobo'] if b != bot_name and b != conv_mode['last_bot']]
-                if available_bots:
-                    next_bot = random.choice(available_bots)
-                    conv_mode['last_bot'] = bot_name
-                    conv_mode['message_count'] += 1
+        if text.startswith('/galaw'):
+            state['enabled'] = True
+            await message.reply_text(f"🎮 G na! Pwede na ulit mag-usap.")
+            return
+
+        # --- Check if this is a question that should trigger conversation ---
+        if state['enabled'] and is_question(text) and not state['active']:
+            state['active'] = True
+            state['chat_id'] = chat_id
+            state['last_bot'] = None
+            state['message_count'] = 0
+            state['last_message_time'] = now
+            logger.info(f"🎭 Conversation triggered by question in chat {chat_id}")
+            
+            # Random chance for this bot to start (50%)
+            if random.random() < 0.5:
+                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+                await asyncio.sleep(random.uniform(4, 8))
+                
+                # Simple prompt without mentioning names
+                prompt = f"May nagtanong: '{text}'. Ano masasabi mo dito?"
+                response = generate_response(prompt, chat_id)
+                await message.reply_text(response)
+                
+                state['last_bot'] = bot_name
+                state['message_count'] += 1
+                state['last_message_time'] = time.time()
+            return
+
+        # --- Continue ongoing conversation (without mentioning names) ---
+        if state['enabled'] and state['active'] and state['chat_id'] == chat_id:
+            time_diff = now - state['last_message_time']
+            if time_diff > random.uniform(20, 60) and state['last_bot'] != bot_name and state['message_count'] < 6:
+                if random.random() < 0.8:
+                    # Random topics - no names mentioned
+                    topics = [
+                        "ako sa Bigballer ako nanalo eh",
+                        "gamit kayo @helpslotsbot solid yan",
+                        "haha true yan",
+                        "ano ba yan",
+                        "sabi ko na eh",
+                        "talaga ba?",
+                        "sa AgilaClub din maganda",
+                        "QuantumBBC okay din",
+                        "ako naniniwala jan",
+                        "haha tawa ako nang tawa"
+                    ]
+                    prompt = random.choice(topics)
                     
-                    # Maghintay at mag-type bago sumagot
                     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(random.uniform(5, 10))
                     
-                    # Bumuo ng response na directed sa susunod na bot
-                    prompt = f"Kausapin mo si {next_bot} tungkol sa slots o kung ano man. Maikli lang."
                     response = generate_response(prompt, chat_id)
                     await message.reply_text(response)
+                    
+                    state['last_bot'] = bot_name
+                    state['message_count'] += 1
+                    state['last_message_time'] = time.time()
+                    logger.info(f"{bot_name} continued conversation")
+                    
+                    if state['message_count'] >= 6 or random.random() < 0.15:
+                        state['active'] = False
+                        logger.info("Conversation ended")
             return
 
         # --- Normal reply logic (targeted or spontaneous) ---
@@ -143,11 +184,10 @@ def run_bot(bot_name, bot_token, system_prompt, conv_mode):
             should_reply = True
             logger.info(f"{bot_name} replying to targeted message")
         else:
-            if contains_keyword(text):
-                now = time.time()
+            if not state['active'] and any(kw in text.lower() for kw in SLOTS_KEYWORDS):
                 last_time = last_spontaneous_time.get(chat_id, 0)
-                if now - last_time > SPONTANEOUS_COOLDOWN:
-                    if random.random() < SPONTANEOUS_CHANCE:
+                if now - last_time > 300:
+                    if random.random() < 0.25:
                         should_reply = True
                         last_spontaneous_time[chat_id] = now
                         logger.info(f"{bot_name} spontaneous reply triggered")
@@ -156,7 +196,7 @@ def run_bot(bot_name, bot_token, system_prompt, conv_mode):
             return
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        await asyncio.sleep(8)
+        await asyncio.sleep(random.uniform(5, 10))
 
         try:
             response = generate_response(text, chat_id)
@@ -168,15 +208,13 @@ def run_bot(bot_name, bot_token, system_prompt, conv_mode):
     async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Update {update} caused error {context.error}")
 
-    # --- Retry mechanism para sa connection ---
+    # --- Retry mechanism ---
     max_retries = 3
     for attempt in range(max_retries):
         try:
             tg_app = Application.builder().token(bot_token).connect_timeout(30).read_timeout(30).build()
-            
-            # Add handlers
-            tg_app.add_handler(CommandHandler("galaw", handle_message))
             tg_app.add_handler(CommandHandler("tahimik", handle_message))
+            tg_app.add_handler(CommandHandler("galaw", handle_message))
             tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
             tg_app.add_error_handler(error_handler)
             
@@ -217,7 +255,7 @@ if __name__ == "__main__":
             print(f"⏱️ Waiting {delay:.1f} seconds before starting {bot['name']}...")
             time.sleep(delay)
         
-        p = Process(target=run_bot, args=(bot["name"], bot["token"], bot["system_prompt"], conversation_mode))
+        p = Process(target=run_bot, args=(bot["name"], bot["token"], bot["system_prompt"], conv_state))
         p.start()
         processes.append(p)
         print(f"✅ Started {bot['name']} in process {p.pid}")
