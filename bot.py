@@ -10,7 +10,7 @@ from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# --- Load configuration (non-sensitive) ---
+# --- Load configuration ---
 with open('config.json', 'r') as f:
     config = json.load(f)
 
@@ -19,15 +19,13 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable not set")
 
-# Bot tokens: we expect three environment variables: BOT_TOKEN_TAWA, BOT_TOKEN_ISIP, BOT_TOKEN_BOBO
 TOKEN_TAWA = os.environ.get("BOT_TOKEN_TAWA")
 TOKEN_ISIP = os.environ.get("BOT_TOKEN_ISIP")
 TOKEN_BOBO = os.environ.get("BOT_TOKEN_BOBO")
 
 if not all([TOKEN_TAWA, TOKEN_ISIP, TOKEN_BOBO]):
-    raise ValueError("One or more bot tokens are missing. Set BOT_TOKEN_TAWA, BOT_TOKEN_ISIP, BOT_TOKEN_BOBO")
+    raise ValueError("Missing bot tokens. Set BOT_TOKEN_TAWA, BOT_TOKEN_ISIP, BOT_TOKEN_BOBO")
 
-# Attach tokens to bot configs
 bots_config = [
     {"name": "Tawa", "token": TOKEN_TAWA, "system_prompt": config["bots"][0]["system_prompt"]},
     {"name": "Isip", "token": TOKEN_ISIP, "system_prompt": config["bots"][1]["system_prompt"]},
@@ -37,7 +35,7 @@ bots_config = [
 # --- Shared OpenAI Client ---
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Spontaneous reply settings ---
+# --- Settings ---
 SPONTANEOUS_KEYWORDS = [
     'slot', 'jackpot', 'casino', 'manalo', 'talo', 'sugal', 'pustahan',
     'bigballer', 'agilaclub', 'quantumbbc', 'fortuneplay', 'helpslotsbot',
@@ -46,7 +44,7 @@ SPONTANEOUS_KEYWORDS = [
 SPONTANEOUS_CHANCE = 0.3
 SPONTANEOUS_COOLDOWN = 300  # 5 minutes
 
-# ==================== BOT WORKER FUNCTION ====================
+# ==================== BOT WORKER ====================
 def run_bot(bot_name, bot_token, system_prompt):
     logging.basicConfig(format=f"%(asctime)s - {bot_name} - %(levelname)s - %(message)s", level=logging.INFO)
     logger = logging.getLogger(__name__)
@@ -91,7 +89,6 @@ def run_bot(bot_name, bot_token, system_prompt):
         message = update.message
         text = message.text
 
-        # Check if targeted
         is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id
         is_mention = context.bot.username and f"@{context.bot.username}" in text
 
