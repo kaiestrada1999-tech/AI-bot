@@ -8,7 +8,7 @@ from multiprocessing import Process
 from flask import Flask
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 # --- Load configuration ---
 with open('config.json', 'r') as f:
@@ -27,9 +27,9 @@ if not all([TOKEN_TAWA, TOKEN_ISIP, TOKEN_BOBO]):
     raise ValueError("Missing bot tokens. Set BOT_TOKEN_TAWA, BOT_TOKEN_ISIP, BOT_TOKEN_BOBO")
 
 bots_config = [
-    {"name": "Tawa", "token": TOKEN_TAWA, "system_prompt": config["bots"][0]["system_prompt"]},
-    {"name": "Isip", "token": TOKEN_ISIP, "system_prompt": config["bots"][1]["system_prompt"]},
-    {"name": "Bobo", "token": TOKEN_BOBO, "system_prompt": config["bots"][2]["system_prompt"]},
+    {"name": "Tawa", "token": TOKEN_TAWA, "system_prompt": config["bots"][0]["system_prompt"], "is_controller": True},
+    {"name": "Isip", "token": TOKEN_ISIP, "system_prompt": config["bots"][1]["system_prompt"], "is_controller": False},
+    {"name": "Bobo", "token": TOKEN_BOBO, "system_prompt": config["bots"][2]["system_prompt"], "is_controller": False},
 ]
 
 # --- Shared OpenAI Client ---
@@ -44,8 +44,22 @@ SPONTANEOUS_KEYWORDS = [
 SPONTANEOUS_CHANCE = 0.3
 SPONTANEOUS_COOLDOWN = 300  # 5 minutes
 
+# --- State file ---
+STATE_FILE = "/tmp/bot_state.txt"  # /tmp is writable in Render
+
+def read_state():
+    try:
+        with open(STATE_FILE, 'r') as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "tahimik"  # default
+
+def write_state(state):
+    with open(STATE_FILE, 'w') as f:
+        f.write(state)
+
 # ==================== BOT WORKER ====================
-def run_bot(bot_name, bot_token, system_prompt):
+def run_bot(bot_name, bot_token, system_prompt, is_controller):
     logging.basicConfig(format=f"%(asctime)s - {bot_name} - %(levelname)s - %(message)s", level=logging.INFO)
     logger = logging.getLogger(__name__)
 
@@ -89,6 +103,28 @@ def run_bot(bot_name, bot_token, system_prompt):
         message = update.message
         text = message.text
 
+        # Handle commands (only controller bot responds to /galaw and /tahimik)
+        if is_controller and text.startswith('/'):
+            if text == '/galaw':
+                write_state('galaw')
+                await message.reply_text("🕺 G na! Mag-usap tayo mga pre!")
+                # Trigger a conversation starter
+                time.sleep(2)
+                await message.reply_text("Uy, @isip_slots_bot @bobo_slots_bot, gising! Kwentuhan tayo about slots!")
+                return
+            elif text == '/tahimik':
+                write_state('tahimik')
+                await message.reply_text("🤫 Sige, tahimik muna. Balik na lang kayo pag may kailangan.")
+                return
+            else:
+                return  # ignore other commands
+
+        # Check current state
+        current_state = read_state()
+        if current_state == 'tahimik':
+            return  # Don't respond if in silent mode
+
+        # For non-command messages, proceed with normal logic
         is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id
         is_mention = context.bot.username and f"@{context.bot.username}" in text
 
@@ -127,18 +163,17 @@ def run_bot(bot_name, bot_token, system_prompt):
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # Taasan ang connection timeout
             tg_app = Application.builder().token(bot_token).connect_timeout(30).read_timeout(30).build()
             tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
             tg_app.add_error_handler(error_handler)
             
             logger.info(f"{bot_name} starting (attempt {attempt+1})...")
             tg_app.run_polling()
-            break  # Pag successful, exit loop
+            break
         except Exception as e:
             logger.error(f"{bot_name} failed to start: {e}")
             if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+                wait_time = (attempt + 1) * 5
                 logger.info(f"{bot_name} retrying in {wait_time} seconds...")
                 time.sleep(wait_time)
             else:
@@ -159,19 +194,20 @@ def run_flask():
 
 # ==================== MAIN ====================
 if __name__ == "__main__":
+    # Initialize state file to 'tahimik' by default
+    write_state('tahimik')
+    
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
     processes = []
     for i, bot in enumerate(bots_config):
-        # Maghintay ng random na pagitan bago i-start ang bawat bot
-        # para hindi sabay-sabay mag-connect sa Telegram
         if i > 0:
-            delay = random.uniform(3, 7)  # 3-7 seconds delay
+            delay = random.uniform(3, 7)
             print(f"⏱️ Waiting {delay:.1f} seconds before starting {bot['name']}...")
             time.sleep(delay)
         
-        p = Process(target=run_bot, args=(bot["name"], bot["token"], bot["system_prompt"]))
+        p = Process(target=run_bot, args=(bot["name"], bot["token"], bot["system_prompt"], bot["is_controller"]))
         p.start()
         processes.append(p)
         print(f"✅ Started {bot['name']} in process {p.pid}")
