@@ -5,7 +5,7 @@ import time
 import threading
 import torch
 from flask import Flask
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import BlenderbotSmallForConditionalGeneration, BlenderbotSmallTokenizer
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -23,6 +23,9 @@ torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
 os.environ["OMP_NUM_THREADS"] = "1"
 
+# Para tipirin ang memory sa pag-load ng model
+os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
+
 REPLY_TO_ALL = True           # True = sa lahat ng message sasagot; False = sa tanong lang
 QUESTION_ONLY = not REPLY_TO_ALL
 DELAY_SECONDS = 10             # Delay bago sumagot
@@ -33,11 +36,13 @@ logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # ==================== LOAD MODEL (once) ====================
-logger.info("Loading DialoGPT model...")
-model_name = "microsoft/DialoGPT-small"
-tokenizer = AutoTokenizer.from_pretrained(model_name)
-model = AutoModelForCausalLM.from_pretrained(model_name)
-tokenizer.pad_token = tokenizer.eos_token
+logger.info("Loading BlenderBot Small model...")
+model_name = "facebook/blenderbot_small-90M"
+tokenizer = BlenderbotSmallTokenizer.from_pretrained(model_name)
+model = BlenderbotSmallForConditionalGeneration.from_pretrained(
+    model_name,
+    low_cpu_mem_usage=True
+)
 logger.info("Model loaded successfully!")
 
 # ==================== CONVERSATION HISTORY ====================
@@ -61,33 +66,38 @@ def is_question(text: str) -> bool:
     return False
 
 def generate_response(user_input: str, history_key: int) -> str:
-    new_ids = tokenizer.encode(user_input + tokenizer.eos_token, return_tensors='pt')
-    history = chat_histories.get(history_key)
+    # Simple history: store last 4 exchanges
+    if history_key not in chat_histories:
+        chat_histories[history_key] = []
 
-    if history is not None:
-        bot_input_ids = torch.cat([history, new_ids], dim=-1)
-    else:
-        bot_input_ids = new_ids
+    # Add user input to history
+    chat_histories[history_key].append(user_input)
 
-    attention_mask = torch.ones_like(bot_input_ids)
+    # Tokenize current input
+    inputs = tokenizer([user_input], return_tensors="pt", truncation=True, max_length=128)
+
+    # Generate response
     with torch.no_grad():
-        history = model.generate(
-            bot_input_ids,
-            attention_mask=attention_mask,
-            max_length=1000,
-            pad_token_id=tokenizer.eos_token_id,
+        reply_ids = model.generate(
+            **inputs,
+            max_length=100,
             do_sample=True,
             top_k=50,
             top_p=0.95,
             temperature=0.8,
-            no_repeat_ngram_size=3,
+            pad_token_id=tokenizer.eos_token_id
         )
 
-    chat_histories[history_key] = history
+    response = tokenizer.batch_decode(reply_ids, skip_special_tokens=True)[0]
 
-    response_ids = history[:, bot_input_ids.shape[-1]:]
-    response = tokenizer.decode(response_ids[0], skip_special_tokens=True)
+    # Add bot response to history
+    chat_histories[history_key].append(response)
 
+    # Keep only last 10 exchanges para di lumaki masyado
+    if len(chat_histories[history_key]) > 10:
+        chat_histories[history_key] = chat_histories[history_key][-10:]
+
+    # Filipino touches
     if random.random() < 0.3:
         response = random.choice(PREFIXES) + response.lower()
     if random.random() < 0.4:
@@ -127,12 +137,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Ipakita ang typing at maghintay
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    time.sleep(DELAY_SECONDS)  # Blocking, pero okay lang dahil isa lang bot instance
+    time.sleep(DELAY_SECONDS)
 
     try:
         response = generate_response(message_text, history_key)
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error generating response: {e}")
         response = "Sorry, may error. Paki-ulit?"
 
     await update.message.reply_text(response)
