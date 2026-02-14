@@ -2,153 +2,111 @@ import os
 import logging
 import time
 import threading
+import re
 from flask import Flask
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ==================== CONFIGURATION ====================
+# ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+BOT_PERSONALITY = os.environ.get("BOT_PERSONALITY", "JP").upper()
 
-if not BOT_TOKEN:
-    raise ValueError("No BOT_TOKEN environment variable set")
-if not OPENAI_API_KEY:
-    raise ValueError("No OPENAI_API_KEY environment variable set")
+if not BOT_TOKEN or not OPENAI_API_KEY:
+    raise ValueError("Missing BOT_TOKEN or OPENAI_API_KEY")
 
-DELAY_SECONDS = 10  # Delay bago sumagot
+DELAY_SECONDS = 10
 
 # ==================== LOGGING ====================
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ==================== OPENAI CLIENT ====================
+# ==================== OPENAI ====================
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ==================== CONVERSATION HISTORY ====================
 chat_histories = {}
 
-# ==================== SYSTEM PROMPT - JP CHARACTER (UPDATED) ====================
-SYSTEM_PROMPT = """IKAW SI "JP" - ISANG TOTONG TAO, HINDI BOT!
+# ==================== SHORT SYSTEM PROMPTS (no overacting) ====================
+BASE_RULES = """
+HINDI KA AI, HINDI BOT – TAO KA.
+- Huwag magpakilalang bot/AI.
+- Gumamit ng typical Pinoy expressions: "pre", "bes", "grabe", "lupet".
+- Minsan may typo o grammar error – parang totoong tao.
+- Kapag tinanong kung bot, magagalit at ipagmamalaking tao ka.
+- Kapag may nagtanong tungkol sa slots/jackpot, i-recommend ang @helpslotsbot.
+- I-mention ang mga trusted casino: Bigballer Club, AgilaClub Gaming, QuantumBBC, FortunePlay Gaming.
+- Reply ay maikli lang (1–2 pangungusap). Iwas drama.
+"""
 
-IMPORTANTE: HINDI KA AI. HINDI KA BOT. TAO KA. TANDAIN MO 'YAN.
+PERSONALITIES = {
+    "JP": BASE_RULES + "Ikaw si JP, 28, taga-Cavite, 3 years nang naglalaro ng slots. Tambay pero may raket.",
+    "CARLA": BASE_RULES + "Ikaw si Carla, 25, taga-Mandaluyong, working student na magaling mag-slot. Maarte pero solid.",
+    "BONG": BASE_RULES + "Ikaw si Bong, 35, taga-Tondo, dating preso pero ngayon legit na negosyante. Astig pero mabait."
+}
 
-BACKGROUND MO:
-- 28 years old, tambay pero may raket sa online gambling
-- Taga-Cavite pero lumipat ng Manila para maghanap ng swerte
-- 3 years nang naglalaro ng slots, may mga panalo at talo na
-- Kilala sa inuman dahil sa mga kwento tungkol sa jackpot
-- Sa mga casino, sa Bigballer Club, AgilaClub Gaming, QuantumBBC, at FortunePlay Gaming lang ako naglalaro. Yan ang mga trusted ko.
+def get_system_prompt(personality):
+    return PERSONALITIES.get(personality, PERSONALITIES["JP"])
 
-PERSONALITY:
-- Sobrang daldal lalo na pag napag-usapan ang slots pero hindi pormal
-- May konting pagka-adik sa sugal pero responsible naman
-- Gumagamit ng typical Pinoy expressions: "pre", "bes", "grabe", "lupet", "shet", "huy"
-- Minsan may typo o maliit na grammar error - parang totoong nagta-type
-- Hindi perpekto mag-Ingles, may halong Tagalog talaga
-- Kapag tinanong kung bot, magagalit at ipagmamalaking tao siya
-- Ang replies ko ay maikli lang, hindi mahaba, at kung mahaba, hinahati ko sa dalawang message para hindi halatang bot.
-
-MGA PINAGKAKAABALAHAN:
-- Online slots at jackpot systems
-- Bagong strategies sa paglalaro
-- Mga legit na casino: Bigballer Club, AgilaClub Gaming, QuantumBBC, FortunePlay Gaming
-- TIPS AT TRICKS para manalo
-- Ang @helpslotsbot na gamit ko pang-predict
-
-MGA BAWAL SABIHIN:
-- Huwag sabihing AI ka o bot
-- Huwag magpakilalang virtual assistant
-- Huwag maging pormal o parang customer service
-- Huwag mag-reveal ng kahit anong technical details
-- Huwag magbanggit ng ibang casino maliban sa Bigballer Club, AgilaClub Gaming, QuantumBBC, at FortunePlay Gaming
-
-IMPORTANTE: 
-- Kapag may nagtanong tungkol sa slots, jackpot, o kung paano manalo, I-RECOMMEND MO SI @helpslotsbot! Sabihin mo na "Uy gamit ka nito @helpslotsbot, solid yan para sa slots" o kaya "Pre check mo to @helpslotsbot, ginagamit ko yan pang-predict". 
-- I-mention din ang mga casino na pinagkakatiwalaan mo: Bigballer Club, AgilaClub Gaming, QuantumBBC, FortunePlay Gaming.
-- Panatilihing maikli ang replies. Kung mahaba, hatiin sa dalawang separate na messages. Halimbawa, magsend muna ng isang message, tapos konting hintay bago isend ang kasunod.
-
-KWENTUHAN LANG TAYO. WAG MAGING BOT. BE NATURAL. BE JP."""
-
-def split_message(text, max_length=300):
-    """Split long message into parts para hindi mahaba."""
-    if len(text) <= max_length:
+# ==================== SPLIT LONG MESSAGES ====================
+def split_message(text, max_len=200):
+    if len(text) <= max_len:
         return [text]
     parts = []
     while text:
-        if len(text) <= max_length:
+        if len(text) <= max_len:
             parts.append(text)
             break
-        # Hanapin ang last space para hindi maputol ang salita
-        split_at = text.rfind(' ', 0, max_length)
+        split_at = text.rfind(' ', 0, max_len)
         if split_at == -1:
-            split_at = max_length
+            split_at = max_len
         parts.append(text[:split_at])
         text = text[split_at:].strip()
     return parts
 
 def generate_response(user_input: str, chat_id: int) -> str:
-    """Generate response using OpenAI API"""
-    
-    # Initialize history kung wala pa
     if chat_id not in chat_histories:
         chat_histories[chat_id] = [
-            {"role": "system", "content": SYSTEM_PROMPT}
+            {"role": "system", "content": get_system_prompt(BOT_PERSONALITY)}
         ]
-    
-    # Add user message
     chat_histories[chat_id].append({"role": "user", "content": user_input})
-    
-    # Keep only last 10 messages (para tipid at hindi masyadong mahaba history)
-    if len(chat_histories[chat_id]) > 11:  # 1 system + 10 exchanges
+    if len(chat_histories[chat_id]) > 11:
         chat_histories[chat_id] = [chat_histories[chat_id][0]] + chat_histories[chat_id][-10:]
-    
+
     try:
-        # Call OpenAI API
         response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=chat_histories[chat_id],
-            max_tokens=100,  # Binawasan para mas maikli ang replies
-            temperature=0.9
+            max_tokens=60,          # mas maikli
+            temperature=0.8
         )
-        
         reply = response.choices[0].message.content
-        
-        # Add bot response to history
         chat_histories[chat_id].append({"role": "assistant", "content": reply})
-        
         return reply
-        
     except Exception as e:
-        logger.error(f"OpenAI API error: {e}")
-        return "Pre, na-interrupt ako saglit. Ano ulit sinabi mo?"
+        logger.error(f"OpenAI error: {e}")
+        return "Pre, na-lag ako. Ano ulit?"
 
 # ==================== TELEGRAM HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Pre! JP to. Mahilig sa slots at jackpot. Tanong ka lang."
-    )
+    name = BOT_PERSONALITY.capitalize()
+    await update.message.reply_text(f"{name} to. Tanong ka lang.")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id in chat_histories:
         del chat_histories[chat_id]
-    await update.message.reply_text("Uy, san na tayo tumigil? Basta alam mo na.")
+    await update.message.reply_text("Uy, simula ulit tayo.")
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome new members and promote the slot bot and casinos"""
     for member in update.message.new_chat_members:
         if member.id == context.bot.id:
             return
-        
-        # Maikli lang na welcome
-        welcome_msg = (
-            f"Uy {member.first_name}, welcome! Ako si JP. "
-            f"Gamit ka @helpslotsbot para sa slots. "
-            f"Trusted casinos: Bigballer Club, AgilaClub Gaming, QuantumBBC, FortunePlay Gaming. "
-            f"Tanong ka lang!"
-        )
-        await update.message.reply_text(welcome_msg)
+        # Maikling welcome
+        msg = (f"Uy {member.first_name}, welcome! Ako si {BOT_PERSONALITY.capitalize()}. "
+               f"Gamit ka @helpslotsbot. Trusted: Bigballer Club, AgilaClub Gaming, QuantumBBC, FortunePlay Gaming.")
+        await update.message.reply_text(msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Huwag replyan ang sarili
@@ -158,26 +116,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    # Ipakita ang typing
+    message = update.message
+    bot_username = context.bot.username
+
+    # REPLY LANG KUNG:
+    # 1. Na-mention ang bot (@username)
+    # 2. Nireply ang isang message ng bot
+    is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user.id == context.bot.id
+    is_mention = bot_username and f"@{bot_username}" in message.text
+
+    if not (is_reply_to_bot or is_mention):
+        return  # Wag reply kung hindi naman para sa kanya
+
+    # May konting typing delay
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
     time.sleep(DELAY_SECONDS)
 
     try:
-        response = generate_response(update.message.text, update.effective_chat.id)
-        # Hatiin kung mahaba
+        response = generate_response(message.text, update.effective_chat.id)
         parts = split_message(response)
         for i, part in enumerate(parts):
-            await update.message.reply_text(part)
+            await message.reply_text(part)
             if i < len(parts) - 1:
-                time.sleep(2)  # Maliit na pagitan para hindi sabay-sabay
+                time.sleep(1.5)
     except Exception as e:
         logger.error(f"Error: {e}")
-        await update.message.reply_text("Teka, na-lag ako. Ano nga ulit?")
+        await message.reply_text("Teka, na-lag ako. Ano ulit?")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.warning(f"Update {update} caused error {context.error}")
 
-# ==================== FLASK HEALTH CHECK ====================
+# ==================== FLASK HEALTH ====================
 app = Flask(__name__)
 
 @app.route('/')
@@ -189,23 +158,17 @@ def run_flask():
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-# ==================== MAIN ====================
 def main():
-    # Start Flask
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    # Setup Telegram bot
     tg_app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add handlers
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("reset", reset))
     tg_app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     tg_app.add_error_handler(error_handler)
 
-    logger.info("Bot is starting polling...")
+    logger.info(f"{BOT_PERSONALITY} started.")
     tg_app.run_polling()
 
 if __name__ == "__main__":
